@@ -7,6 +7,10 @@ final class AnswerPopup {
     private let answerRow: NSStackView
     private let answerLabel = NSTextField(labelWithString: "")
     private let graphView = GraphView()
+    private let tabLabel = NSTextField(labelWithString: "⇥")
+    /// The graph on screen, for copying.
+    private var graph: Evaluator.Graph?
+    private var hideTimer: Timer?
 
     init() {
         panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
@@ -30,7 +34,6 @@ final class AnswerPopup {
         answerLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
         answerLabel.textColor = .labelColor
 
-        let tabLabel = NSTextField(labelWithString: "⇥")
         tabLabel.font = .systemFont(ofSize: 13, weight: .regular)
         tabLabel.textColor = .tertiaryLabelColor
 
@@ -55,6 +58,9 @@ final class AnswerPopup {
     }
 
     func show(_ match: Evaluator.Match, near caret: NSRect) {
+        hideTimer?.invalidate()
+        tabLabel.isHidden = false
+        graph = match.graph
         let isGraph = match.graph != nil
         if let graph = match.graph {
             graphView.plot(graph)
@@ -86,7 +92,28 @@ final class AnswerPopup {
     }
 
     func hide() {
+        hideTimer?.invalidate()
         panel.orderOut(nil)
+    }
+
+    /// Copies the graph on screen to the clipboard as an image, then briefly confirms it in place.
+    func copyGraph() {
+        guard let graph, let image = GraphView.image(of: graph) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([image])
+
+        let topLeft = NSPoint(x: panel.frame.minX, y: panel.frame.maxY)
+        answerLabel.stringValue = "Copied"
+        tabLabel.isHidden = true
+        answerRow.isHidden = false
+        graphView.isHidden = true
+        content.edgeInsets = NSEdgeInsets(top: 7, left: 12, bottom: 7, right: 12)
+        panel.contentView!.layoutSubtreeIfNeeded()
+        let size = panel.contentView!.fittingSize
+        panel.setFrame(NSRect(x: topLeft.x, y: topLeft.y - size.height, width: size.width, height: size.height),
+                       display: true)
+        hideTimer?.invalidate()
+        hideTimer = Timer.scheduledTimer(withTimeInterval: 0.9, repeats: false) { [weak self] _ in self?.hide() }
     }
 }
 
@@ -106,6 +133,24 @@ final class GraphView: NSView {
     ]
 
     override var intrinsicContentSize: NSSize { NSSize(width: 260, height: 160 + Self.labelHeight) }
+
+    /// A larger, light-mode rendering of a graph on white, for pasting into documents.
+    static func image(of graph: Evaluator.Graph) -> NSImage? {
+        let padding: CGFloat = 16
+        let view = GraphView(frame: NSRect(x: padding, y: padding, width: 520, height: 320 + labelHeight))
+        view.plot(graph)
+        let canvas = NSView(frame: view.frame.insetBy(dx: -padding, dy: -padding).offsetBy(dx: padding, dy: padding))
+        canvas.wantsLayer = true
+        canvas.layer?.backgroundColor = NSColor.white.cgColor
+        canvas.addSubview(view)
+        canvas.appearance = NSAppearance(named: .aqua)
+
+        guard let bitmap = canvas.bitmapImageRepForCachingDisplay(in: canvas.bounds) else { return nil }
+        canvas.cacheDisplay(in: canvas.bounds, to: bitmap)
+        let image = NSImage(size: canvas.bounds.size)
+        image.addRepresentation(bitmap)
+        return image
+    }
 
     func plot(_ graph: Evaluator.Graph) {
         isTrigonometric = graph.isTrigonometric
@@ -220,5 +265,225 @@ final class GraphView: NSView {
     private func xLabel(_ value: Double) -> String {
         guard isTrigonometric, value != 0 else { return Evaluator.format(value) }
         return value < 0 ? "-2π" : "2π"
+    }
+}
+
+/// The VBA suggestion list next to the caret: up to four rows, one selected.
+final class SuggestionPopup {
+    private let panel: NSPanel
+    private let list = NSStackView()
+    private(set) var suggestions: [VBASuggestion] = []
+    private(set) var selected = 0
+    private var caret = NSRect.zero
+
+    var isVisible: Bool { panel.isVisible }
+    var selectedSuggestion: VBASuggestion? { suggestions.indices.contains(selected) ? suggestions[selected] : nil }
+
+    init() {
+        panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: true)
+        panel.isFloatingPanel = true
+        panel.level = .popUpMenu
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let background = NSVisualEffectView()
+        background.material = .popover
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 10
+        background.layer?.masksToBounds = true
+
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 2
+        list.edgeInsets = NSEdgeInsets(top: 6, left: 6, bottom: 6, right: 6)
+        list.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(list)
+        NSLayoutConstraint.activate([
+            list.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            list.topAnchor.constraint(equalTo: background.topAnchor),
+            list.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+        ])
+        panel.contentView = background
+    }
+
+    func show(_ suggestions: [VBASuggestion], near caret: NSRect) {
+        guard !suggestions.isEmpty else { return hide() }
+        self.suggestions = Array(suggestions.prefix(VBASuggestions.maxCount))
+        self.caret = caret
+        selected = 0
+        render()
+    }
+
+    func move(by offset: Int) {
+        guard !suggestions.isEmpty else { return }
+        selected = (selected + offset + suggestions.count) % suggestions.count
+        render()
+    }
+
+    func hide() {
+        suggestions = []
+        panel.orderOut(nil)
+    }
+
+    private func render() {
+        list.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for (index, suggestion) in suggestions.enumerated() {
+            list.addArrangedSubview(row(for: suggestion, isSelected: index == selected))
+        }
+        for view in list.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: list.widthAnchor, constant: -12).isActive = true
+        }
+        panel.contentView!.layoutSubtreeIfNeeded()
+        let size = panel.contentView!.fittingSize
+
+        // Below the line being typed, so the code itself stays visible.
+        var origin = NSPoint(x: caret.minX - 12, y: caret.minY - size.height - 4)
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(caret.origin) }) ?? NSScreen.main {
+            let frame = screen.visibleFrame
+            if origin.y < frame.minY + 4 { origin.y = caret.maxY + 4 }
+            origin.x = min(max(origin.x, frame.minX + 4), frame.maxX - size.width - 4)
+            origin.y = min(max(origin.y, frame.minY + 4), frame.maxY - size.height - 4)
+        }
+        panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        panel.orderFrontRegardless()
+    }
+
+    private func row(for suggestion: VBASuggestion, isSelected: Bool) -> NSView {
+        let label = NSTextField(labelWithString: suggestion.label)
+        label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        label.textColor = isSelected ? .alternateSelectedControlTextColor : .labelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.widthAnchor.constraint(lessThanOrEqualToConstant: 420).isActive = true
+
+        let content = NSStackView(views: [label])
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 6
+        content.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 6
+        content.layer?.backgroundColor = isSelected ? NSColor.controlAccentColor.cgColor : NSColor.clear.cgColor
+        return content
+    }
+}
+
+/// The code-check card above the line: the helper's face, what's wrong where, and a remark.
+final class IssuePopup {
+    private let panel: NSPanel
+    private let background = NSVisualEffectView()
+    private let tint = NSView()
+    private let face = NSTextField(labelWithString: "")
+    private let title = NSTextField(wrappingLabelWithString: "")
+    private let remark = NSTextField(labelWithString: "")
+    private var hideTimer: Timer?
+    private var shakeTimer: Timer?
+
+    var isVisible: Bool { panel.isVisible }
+
+    init() {
+        panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: true)
+        panel.isFloatingPanel = true
+        panel.level = .popUpMenu
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        background.material = .popover
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 10
+        background.layer?.masksToBounds = true
+
+        tint.wantsLayer = true
+        tint.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.14).cgColor
+        tint.translatesAutoresizingMaskIntoConstraints = false
+
+        face.font = .systemFont(ofSize: 28)
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.preferredMaxLayoutWidth = 320
+        title.maximumNumberOfLines = 2
+        remark.font = .systemFont(ofSize: 12)
+        remark.textColor = .secondaryLabelColor
+
+        let text = NSStackView(views: [title, remark])
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 2
+        let content = NSStackView(views: [face, text])
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 10
+        content.edgeInsets = NSEdgeInsets(top: 9, left: 12, bottom: 9, right: 14)
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        background.addSubview(tint)
+        background.addSubview(content)
+        NSLayoutConstraint.activate([
+            tint.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            tint.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            tint.topAnchor.constraint(equalTo: background.topAnchor),
+            tint.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            content.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            content.topAnchor.constraint(equalTo: background.topAnchor),
+            content.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+        ])
+        panel.contentView = background
+    }
+
+    /// Shows the card above `caret` for four seconds.
+    func show(_ reaction: Reaction, near caret: NSRect) {
+        face.stringValue = reaction.face
+        title.stringValue = reaction.title
+        remark.stringValue = reaction.remark ?? ""
+        remark.isHidden = reaction.remark == nil
+        tint.isHidden = reaction.level < Grumpiness.maxLevel
+
+        panel.contentView!.layoutSubtreeIfNeeded()
+        let size = panel.contentView!.fittingSize
+        var origin = NSPoint(x: caret.minX - 12, y: caret.maxY + 6)  // above the line; suggestions go below
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(caret.origin) }) ?? NSScreen.main {
+            let frame = screen.visibleFrame
+            if origin.y + size.height > frame.maxY - 4 { origin.y = caret.minY - size.height - 6 }
+            origin.x = min(max(origin.x, frame.minX + 4), frame.maxX - size.width - 4)
+            origin.y = min(max(origin.y, frame.minY + 4), frame.maxY - size.height - 4)
+        }
+        panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        panel.orderFrontRegardless()
+
+        if reaction.level >= Grumpiness.maxLevel - 1 { shake(hard: reaction.level == Grumpiness.maxLevel) }
+        hideTimer?.invalidate()
+        hideTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in self?.hide() }
+    }
+
+    func hide() {
+        hideTimer?.invalidate()
+        shakeTimer?.invalidate()
+        panel.orderOut(nil)
+    }
+
+    /// A quick side-to-side wobble: once when annoyed, longer and wider when furious.
+    private func shake(hard: Bool) {
+        shakeTimer?.invalidate()
+        let home = panel.frame.origin
+        let offsets: [CGFloat] = hard ? [-9, 9, -8, 8, -6, 6, -3, 3, 0] : [-5, 5, -3, 3, 0]
+        var step = 0
+        shakeTimer = Timer.scheduledTimer(withTimeInterval: 0.035, repeats: true) { [weak self] timer in
+            guard let self, step < offsets.count else { timer.invalidate(); return }
+            self.panel.setFrameOrigin(NSPoint(x: home.x + offsets[step], y: home.y))
+            step += 1
+        }
     }
 }

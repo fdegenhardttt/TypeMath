@@ -1,13 +1,23 @@
 import Cocoa
 import ApplicationServices
 import ServiceManagement
+import SwiftUI
 
 /// Marks keystrokes we post ourselves so the tap ignores them.
 private let syntheticMarker: Int64 = 0x4D41_5448
 
 private enum KeyCode {
+    static let a: Int64 = 0
+    static let v: Int64 = 9
+    static let returnKey: Int64 = 36
+    static let enter: Int64 = 76
+    static let escape: Int64 = 53
+    static let downArrow: Int64 = 125
+    static let upArrow: Int64 = 126
     static let tab: Int64 = 48
     static let delete: Int64 = 51
+    static let rightArrow: Int64 = 124
+    static let arrows: Set<Int64> = [123, 124, 125, 126]
     /// Return, enter, escape, arrows, home/end, page up/down, forward delete.
     static let resetting: Set<Int64> = [36, 76, 53, 123, 124, 125, 126, 115, 119, 116, 121, 117]
 }
@@ -21,12 +31,38 @@ private func tapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEve
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tap: CFMachPort?
     private var buffer = ""
+    /// The answer for what was just typed.
     private var pendingMatch: Evaluator.Match?
     /// The text before the caret that `pendingMatch` was found in.
     private var matchedText = ""
+    /// The answer for highlighted text, while its popup shows.
+    private var selectionMatch: Evaluator.Match?
+    private lazy var historyPopover: NSPopover = {
+        let popover = NSPopover()
+        popover.behavior = .transient
+        let host = NSHostingController(rootView: HistoryView(history: .shared))
+        host.sizingOptions = .preferredContentSize  // the popover follows the list's height
+        popover.contentViewController = host
+        return popover
+    }()
     private let popup = AnswerPopup()
+
+    // VBA mode
+    private let suggestionPopup = SuggestionPopup()
+    /// Everything typed in the VBA editor, for editors that don't expose their text.
+    private var vbaTyped = ""
+    /// Bumped on every keystroke so late suggestions for older text are dropped.
+    private var vbaGeneration = 0
+    private var vbaModeCache: (isActive: Bool, checked: Date) = (false, .distantPast)
+    private let issuePopup = IssuePopup()
+    private var grumpiness = Grumpiness()
+    /// The line the caret was on at the last check, to notice when a line is finished.
+    private var vbaLastLine: Int?
+    /// Mistakes already shown, by rule and message, to notice when one gets fixed.
+    private var reportedMistakes = Set<String>()
     private var statusItem: NSStatusItem!
     private var permissionTimer: Timer?
+    private var ratesTimer: Timer?
     /// The app that was in front when the menu opened, for the per-app toggle.
     private var menuTargetApp: NSRunningApplication?
     private let menu = NSMenu()
@@ -41,6 +77,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(Array(newValue), forKey: "disabledApps") }
     }
 
+    private var vbaBuiltIn: Bool {
+        get { !UserDefaults.standard.bool(forKey: "vbaBuiltInOff") }
+        set { UserDefaults.standard.set(!newValue, forKey: "vbaBuiltInOff") }
+    }
+
+    private var vbaCheck: Bool {
+        get { !UserDefaults.standard.bool(forKey: "vbaCheckOff") }
+        set { UserDefaults.standard.set(!newValue, forKey: "vbaCheckOff") }
+    }
+
+    private var grumpyMode: Bool {
+        get { !UserDefaults.standard.bool(forKey: "grumpyOff") }
+        set { UserDefaults.standard.set(!newValue, forKey: "grumpyOff") }
+    }
+
     private var activeInFrontApp: Bool {
         guard let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return true }
         return !disabledApps.contains(id)
@@ -49,7 +100,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "equal.square", accessibilityDescription: "TypeMath")
+        loadOptions()
+        grumpiness.enabled = grumpyMode
         rebuildMenu()
+
+        Currency.refreshIfNeeded()
+        ratesTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in Currency.refreshIfNeeded() }
 
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if AXIsProcessTrustedWithOptions(options) {
@@ -82,6 +138,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appItem.state = disabledApps.contains(id) ? .off : .on
             appItem.isEnabled = enabled
         }
+        menu.addItem(.separator())
+
+        menu.addItem(withTitle: "History…", action: #selector(showHistory), keyEquivalent: "").target = self
+
+        let vbaMenu = NSMenu()
+        let builtIn = vbaMenu.addItem(withTitle: "Suggestions", action: #selector(toggleVBABuiltIn), keyEquivalent: "")
+        builtIn.target = self
+        builtIn.state = vbaBuiltIn ? .on : .off
+        let check = vbaMenu.addItem(withTitle: "Check My Code", action: #selector(toggleVBACheck), keyEquivalent: "")
+        check.target = self
+        check.state = vbaCheck ? .on : .off
+        let grumpy = vbaMenu.addItem(withTitle: "Grumpy Mode", action: #selector(toggleGrumpy), keyEquivalent: "")
+        grumpy.target = self
+        grumpy.state = grumpyMode ? .on : .off
+        grumpy.isEnabled = vbaCheck
+        menu.addItem(withTitle: "VBA Helper", action: nil, keyEquivalent: "").submenu = vbaMenu
+
+        let formatMenu = NSMenu()
+        let grouping = formatMenu.addItem(withTitle: "Group Thousands", action: #selector(toggleGrouping), keyEquivalent: "")
+        grouping.target = self
+        grouping.state = Evaluator.options.groupThousands ? .on : .off
+        formatMenu.addItem(.separator())
+        for (title, decimals) in [("Automatic Decimals", 0), ("2 Decimals", 2), ("4 Decimals", 4)] {
+            let item = formatMenu.addItem(withTitle: title, action: #selector(setDecimals(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = decimals
+            item.state = (Evaluator.options.decimals ?? 0) == decimals ? .on : .off
+        }
+        menu.addItem(withTitle: "Number Format", action: nil, keyEquivalent: "").submenu = formatMenu
 
         let loginItem = menu.addItem(withTitle: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
@@ -95,6 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
         let front = NSWorkspace.shared.frontmostApplication
         menuTargetApp = front?.processIdentifier == ProcessInfo.processInfo.processIdentifier ? nil : front
         rebuildMenu()
@@ -122,10 +208,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
-    // MARK: Keyboard tap
+    @objc private func showHistory() {
+        // Wait for the menu to close, then hang the history panel from the menu bar icon.
+        DispatchQueue.main.async { [self] in
+            guard let button = statusItem.button else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            historyPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc private func toggleGrouping() {
+        Evaluator.options.groupThousands.toggle()
+        saveOptions()
+    }
+
+    @objc private func setDecimals(_ sender: NSMenuItem) {
+        Evaluator.options.decimals = sender.tag == 0 ? nil : sender.tag
+        saveOptions()
+    }
+
+    @objc private func toggleVBABuiltIn() {
+        vbaBuiltIn.toggle()
+        rebuildMenu()
+    }
+
+    @objc private func toggleVBACheck() {
+        vbaCheck.toggle()
+        issuePopup.hide()
+        rebuildMenu()
+    }
+
+    @objc private func toggleGrumpy() {
+        grumpyMode.toggle()
+        grumpiness = Grumpiness()
+        grumpiness.enabled = grumpyMode
+        rebuildMenu()
+    }
+
+    private func loadOptions() {
+        let defaults = UserDefaults.standard
+        Evaluator.options.groupThousands = defaults.bool(forKey: "groupThousands")
+        let decimals = defaults.integer(forKey: "decimals")
+        Evaluator.options.decimals = decimals == 0 ? nil : decimals
+    }
+
+    private func saveOptions() {
+        UserDefaults.standard.set(Evaluator.options.groupThousands, forKey: "groupThousands")
+        UserDefaults.standard.set(Evaluator.options.decimals ?? 0, forKey: "decimals")
+        rebuildMenu()
+    }
+
+    // MARK: Keyboard and mouse tap
 
     private func startTap() {
-        let types: [CGEventType] = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        let types: [CGEventType] = [.keyDown, .leftMouseDown, .leftMouseUp, .rightMouseDown, .otherMouseDown]
         let mask = types.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                           options: .defaultTap, eventsOfInterest: mask,
@@ -150,6 +286,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard enabled, activeInFrontApp,
               event.getIntegerValueField(.eventSourceUserData) != syntheticMarker else { return pass }
 
+        let inVBA = isVBAMode()
+        if type == .leftMouseUp {
+            if !inVBA { checkSelectionSoon() }  // a drag or double-click may have selected text
+            return pass
+        }
         guard type == .keyDown else {
             reset()  // a click moves the caret
             return pass
@@ -163,21 +304,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var chars = [UniChar](repeating: 0, count: 8)
         event.keyboardGetUnicodeString(maxStringLength: chars.count, actualStringLength: &length, unicodeString: &chars)
         let typed = String(utf16CodeUnits: chars, count: length)
+        let isTab = keyCode == KeyCode.tab && modifiers.isEmpty
 
-        // Graphs are only previewed, so "=" and Tab act normally while one is showing.
-        if let match = pendingMatch, let answer = match.answer, !hasShortcutModifier {
-            if typed == "=" {
-                fill(answer)
-                return nil  // swallow the second "="
+        if inVBA {
+            return handleVBAKey(keyCode: keyCode, typed: typed, isTab: isTab, hasShortcutModifier: hasShortcutModifier)
+                ? nil : pass
+        }
+
+        if let match = selectionMatch, !hasShortcutModifier {
+            selectionMatch = nil
+            if isTab {
+                if let answer = match.answer {
+                    self.type(answer)  // typing over the selection replaces it
+                    accept(match)
+                    popup.hide()
+                } else {
+                    popup.copyGraph()
+                }
+                return nil
             }
-            if keyCode == KeyCode.tab, modifiers.isEmpty {
-                replace(length: match.length, with: answer)
-                return nil  // swallow the tab
+            if typed == "=", let answer = match.answer {
+                post(virtualKey: UInt16(KeyCode.rightArrow), text: nil)  // keep the selection, add after it
+                self.type(" = " + answer)
+                accept(match)
+                popup.hide()
+                return nil
+            }
+            popup.hide()
+        }
+
+        if let match = pendingMatch, !hasShortcutModifier {
+            if let answer = match.answer {
+                if typed == "=" {
+                    fill(answer)
+                    accept(match)
+                    return nil  // swallow the second "="
+                }
+                if isTab {
+                    replace(length: match.length, with: answer)
+                    accept(match)
+                    return nil  // swallow the tab
+                }
+            } else if isTab {
+                pendingMatch = nil
+                popup.copyGraph()
+                return nil
             }
         }
 
+        let selects = (event.flags.contains(.maskShift) && KeyCode.arrows.contains(keyCode))
+            || (event.flags.contains(.maskCommand) && keyCode == KeyCode.a)
         if hasShortcutModifier || keyCode == KeyCode.tab || KeyCode.resetting.contains(keyCode) {
             reset()
+            if selects { checkSelectionSoon() }
             return pass
         }
 
@@ -203,22 +382,169 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         matchedText = CaretLocator.textBeforeCaret() ?? buffer
         pendingMatch = Evaluator.match(in: matchedText)
         if let match = pendingMatch {
+            remember(match, equation: String(matchedText.suffix(match.length)))
             popup.show(match, near: CaretLocator.caretRect())
         } else {
             popup.hide()
         }
     }
 
+    // MARK: Selections
+
+    private func checkSelectionSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.checkSelection() }
+    }
+
+    private func checkSelection() {
+        guard let text = CaretLocator.selectedText(), let match = Evaluator.selectionMatch(text) else { return }
+        selectionMatch = match
+        pendingMatch = nil
+        remember(match, equation: text)
+        popup.show(match, near: CaretLocator.caretRect())
+    }
+
+    // MARK: Answers
+
+    /// Makes an answer available as "ans" and adds it to History.
+    private func remember(_ match: Evaluator.Match, equation: String) {
+        guard let answer = match.answer else { return }
+        if let value = match.value, !match.usesAns { Evaluator.lastAnswer = value }
+        History.shared.add(question: equation, answer: answer)
+    }
+
+    /// The user took this answer, so "ans" follows it even if it used "ans" itself.
+    private func accept(_ match: Evaluator.Match) {
+        if let value = match.value { Evaluator.lastAnswer = value }
+    }
+
     private func reset() {
         buffer = ""
         pendingMatch = nil
+        selectionMatch = nil
         popup.hide()
+        issuePopup.hide()
+        cancelVBASuggestions()
     }
 
-    /// "=" again: types the answer after the equation, matching the spacing around "=".
+    // MARK: VBA mode
+
+    /// Whether the VBA editor is in front. Cached briefly, since every keystroke asks.
+    private func isVBAMode() -> Bool {
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == VBAContext.excelBundleID else { return false }
+        if Date().timeIntervalSince(vbaModeCache.checked) > 0.5 {
+            vbaModeCache = (VBAContext.isCodeWindow(), Date())
+        }
+        return vbaModeCache.isActive
+    }
+
+    /// Handles a key in the VBA editor; returns true to swallow it.
+    private func handleVBAKey(keyCode: Int64, typed: String, isTab: Bool, hasShortcutModifier: Bool) -> Bool {
+        pendingMatch = nil  // no maths in code: "=" is assignment there
+        popup.hide()
+        issuePopup.hide()
+
+        if suggestionPopup.isVisible, !hasShortcutModifier {
+            switch keyCode {
+            case KeyCode.tab where isTab:
+                if let suggestion = suggestionPopup.selectedSuggestion { insert(suggestion) }
+                return true
+            case KeyCode.downArrow:
+                suggestionPopup.move(by: 1)
+                return true
+            case KeyCode.upArrow:
+                suggestionPopup.move(by: -1)
+                return true
+            case KeyCode.escape:
+                cancelVBASuggestions()
+                return true
+            default:
+                break
+            }
+        }
+        cancelVBASuggestions()
+        if hasShortcutModifier { return false }
+
+        if keyCode == KeyCode.delete {
+            if !vbaTyped.isEmpty { vbaTyped.removeLast() }
+        } else if keyCode == KeyCode.returnKey || keyCode == KeyCode.enter {
+            vbaTyped += "\n"
+        } else if !typed.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+            vbaTyped += typed
+        }
+        if vbaTyped.count > 4000 { vbaTyped = String(vbaTyped.suffix(4000)) }
+
+        let generation = vbaGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in self?.updateVBA(generation: generation) }
+        return false
+    }
+
+    private func cancelVBASuggestions() {
+        vbaGeneration += 1
+        suggestionPopup.hide()
+    }
+
+    private func updateVBA(generation: Int) {
+        guard generation == vbaGeneration else { return }
+        let shared = VBAContext.moduleAndCaret()
+        let (module, caret) = shared ?? (vbaTyped, vbaTyped.count)
+        checkFinishedLine(module: module, caret: caret, knowsLines: shared != nil)
+        let builtIn = vbaBuiltIn ? VBASuggestions.suggest(module: module, caret: caret) : []
+        if builtIn.isEmpty { suggestionPopup.hide() } else { suggestionPopup.show(builtIn, near: CaretLocator.caretRect()) }
+    }
+
+    /// When the caret has moved to another line, checks the line it left and lets the helper react.
+    private func checkFinishedLine(module: String, caret: Int, knowsLines: Bool) {
+        let line = module.prefix(caret).filter { $0 == "\n" }.count + 1
+        defer { vbaLastLine = line }
+        guard vbaCheck, let finished = vbaLastLine, finished != line else { return }
+
+        let issues = VBALinter.lint(module)
+        let mistakes = Set(issues.filter { $0.kind == .mistake }.map { "\($0.key)|\($0.message)" })
+        let fixed = !reportedMistakes.subtracting(mistakes).isEmpty
+        reportedMistakes.formIntersection(mistakes)
+
+        let issue = issues.first { $0.line == finished && $0.kind == .mistake } ?? issues.first { $0.line == finished }
+        if let issue, issue.kind == .mistake { reportedMistakes.insert("\(issue.key)|\(issue.message)") }
+        var reaction = grumpiness.lineFinished(with: issue, at: Date(), showLine: knowsLines)
+        if reaction == nil, fixed { reaction = grumpiness.mistakeFixed(at: Date()) }
+        if let reaction { issuePopup.show(reaction, near: CaretLocator.caretRect()) }
+    }
+
+    /// Replaces what the suggestion covers and inserts it. Multi-line code is pasted, so the editor's
+    /// auto-indent and syntax checks don't act on each typed line break.
+    private func insert(_ suggestion: VBASuggestion) {
+        cancelVBASuggestions()
+        for _ in 0..<suggestion.replacing { post(virtualKey: UInt16(KeyCode.delete), text: nil) }
+        if suggestion.text.contains("\n") {
+            paste(suggestion.text)
+        } else {
+            type(suggestion.text)
+        }
+        vbaTyped = String(vbaTyped.dropLast(suggestion.replacing)) + suggestion.text
+    }
+
+    private func paste(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        let saved = (pasteboard.pasteboardItems ?? []).map { item -> NSPasteboardItem in
+            let copy = NSPasteboardItem()
+            for type in item.types { if let data = item.data(forType: type) { copy.setData(data, forType: type) } }
+            return copy
+        }
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        post(virtualKey: UInt16(KeyCode.v), text: nil, flags: .maskCommand)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {  // put the user's clipboard back
+            pasteboard.clearContents()
+            if !saved.isEmpty { pasteboard.writeObjects(saved) }
+        }
+    }
+
+    /// "=" again: types the answer after the equation, matching the spacing around "=" or "?".
     private func fill(_ answer: String) {
         var text = answer
-        if matchedText.hasSuffix("=") && matchedText.dropLast().hasSuffix(" ") { text = " " + text }
+        let joinsDirectly = matchedText.hasSuffix(" ")
+            || (matchedText.hasSuffix("=") && !matchedText.dropLast().hasSuffix(" "))  // "4*4=" -> "4*4=16"
+        if !joinsDirectly { text = " " + text }
         type(text)
         buffer = matchedText + text
         pendingMatch = nil
@@ -243,10 +569,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func post(virtualKey: UInt16, text: [UniChar]?) {
+    private func post(virtualKey: UInt16, text: [UniChar]?, flags: CGEventFlags = []) {
         for keyDown in [true, false] {
             guard let event = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: keyDown) else { continue }
-            event.flags = []
+            event.flags = flags
             event.setIntegerValueField(.eventSourceUserData, value: syntheticMarker)
             if var text { event.keyboardSetUnicodeString(stringLength: text.count, unicodeString: &text) }
             event.post(tap: .cgSessionEventTap)
@@ -262,6 +588,15 @@ enum CaretLocator {
         if let rect = axCaretRect() { return rect }
         let mouse = NSEvent.mouseLocation
         return NSRect(x: mouse.x, y: mouse.y - 10, width: 1, height: 20)
+    }
+
+    /// The highlighted text in the focused field, if the app exposes it and it is short.
+    static func selectedText() -> String? {
+        guard let (field, range) = focusedSelection(), range.length > 0, range.length <= 200 else { return nil }
+        var result: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(field, kAXSelectedTextAttribute as CFString, &result) == .success
+        else { return nil }
+        return result as? String
     }
 
     /// The current line up to the caret in the focused text field, if the app exposes it.
@@ -304,8 +639,8 @@ enum CaretLocator {
     private static func axCaretRect() -> NSRect? {
         guard let (field, range) = focusedSelection() else { return nil }
 
-        // Bounds of the character just before the caret.
-        var charRange = CFRange(location: max(range.location - 1, 0), length: 1)
+        // Bounds of the character just before the caret, or the last selected character.
+        var charRange = CFRange(location: max(range.location + range.length - 1, 0), length: 1)
         guard let charValue = AXValueCreate(.cfRange, &charRange) else { return nil }
         var boundsValue: CFTypeRef?
         guard AXUIElementCopyParameterizedAttributeValue(field, kAXBoundsForRangeParameterizedAttribute as CFString,

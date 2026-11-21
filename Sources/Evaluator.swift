@@ -1,6 +1,20 @@
 import Foundation
 
 enum Evaluator {
+    /// How answers are written.
+    struct Options {
+        var groupThousands = false
+        /// Fixed number of decimals, or nil for as many as needed.
+        var decimals: Int?
+    }
+    static var options = Options()
+
+    /// The last answer the user saw or accepted, used by "ans".
+    static var lastAnswer: Double?
+    /// Today's date and the locale for dates; replaceable in tests.
+    static var now: () -> Date = Date.init
+    static var locale = Locale.current
+
     /// A function of x the user typed, e.g. "x^2 - 4" or "sin(x)".
     struct Graph {
         let function: (Double) -> Double
@@ -12,31 +26,82 @@ enum Evaluator {
     struct Match {
         /// The answer to type in, or nil when the equation is a function to graph.
         let answer: String?
-        let graph: Graph?
+        var graph: Graph? = nil
         /// How many characters at the end of the text make up the equation (for replacing it).
         let length: Int
+        /// The numeric answer, for "ans".
+        var value: Double? = nil
+        /// Whether the equation itself uses "ans".
+        var usesAns = false
     }
 
     /// Finds an equation the user just finished typing, e.g. "total 4*4 = " -> 16,
-    /// "5 km in miles =" -> 3.1069 miles, or "y = x^2 =" -> a graph.
+    /// "what's 15% of 80?" -> 12, "5 km in miles =" -> 3.1069 miles, or "y = x^2 =" -> a graph.
     static func match(in text: String) -> Match? {
         var chars = Array(text)
         while chars.last == " " { chars.removeLast() }
+        if chars.last == "?" {
+            // Questions only count when they read like one: "what's 15% of 80?"
+            chars.removeLast()
+            while chars.last == " " { chars.removeLast() }
+            guard let (match, hasLeadIn) = solve(chars, textLength: text.count),
+                  hasLeadIn, match.graph == nil else { return nil }
+            return match
+        }
         guard chars.last == "=" else { return functionDefinition(chars, textLength: text.count) }
         chars.removeLast()
         while chars.last == " " { chars.removeLast() }
+        return solve(chars, textLength: text.count)?.match
+    }
 
-        if let (answer, start) = conversion(chars) {
-            return Match(answer: answer, graph: nil, length: text.count - start)
+    /// The answer for highlighted text such as "12*7", "15% of 80" or "x^2", if all of it is maths.
+    static func selectionMatch(_ text: String) -> Match? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 200, !trimmed.contains("\n") else { return nil }
+        for candidate in [trimmed, trimmed + " ="] {
+            if let match = match(in: candidate), match.length == candidate.count { return match }
         }
-        guard let (parsed, start) = expressionSuffix(chars), parsed.operations > 0 else { return nil }
-        let length = text.count - start
-        if parsed.usesX {
-            let graph = Graph(function: parsed.function, isTrigonometric: parsed.usesTrig)
-            return Match(answer: nil, graph: graph, length: length)
+        return nil
+    }
+
+    /// Solves the maths that ends at the end of `chars` (the "=" or "?" already removed).
+    private static func solve(_ chars: [Character], textLength: Int) -> (match: Match, hasLeadIn: Bool)? {
+        let normalized = Normalizer.normalize(chars)
+        let text = normalized.chars
+
+        var found: (answer: String?, graph: Graph?, value: Double?, usesAns: Bool, start: Int)?
+        if let (answer, start) = dateAnswer(String(text)) ?? currencyConversion(text) ?? conversion(text) {
+            found = (answer, nil, nil, false, start)
+        } else if let (parsed, start) = expressionSuffix(text), parsed.operations > 0 {
+            if parsed.usesX {
+                found = (nil, Graph(function: parsed.function, isTrigonometric: parsed.usesTrig), nil, false, start)
+            } else if let value = parsed.value {
+                found = (format(value), nil, value, parsed.usesAns, start)
+            }
         }
-        guard let value = parsed.value else { return nil }
-        return Match(answer: format(value), graph: nil, length: length)
+        guard let found else { return nil }
+
+        var start = normalized.origin[found.start]
+        let leadIn = leadInStart(chars, before: start)
+        if let leadIn { start = leadIn }
+        let match = Match(answer: found.answer, graph: found.graph, length: textLength - start,
+                          value: found.value, usesAns: found.usesAns)
+        return (match, leadIn != nil)
+    }
+
+    private static let leadIns = ["what is", "what's", "what’s", "whats", "what are", "how much is",
+                                  "how much are", "calculate", "compute", "evaluate"]
+
+    /// Where a lead-in like "what is" starts, if one comes right before `index`, so Tab replaces the whole question.
+    private static func leadInStart(_ chars: [Character], before index: Int) -> Int? {
+        var end = index
+        while end > 0, chars[end - 1] == " " { end -= 1 }
+        let before = String(chars[..<end]).lowercased()
+        for leadIn in leadIns where before.hasSuffix(leadIn) {
+            let start = end - leadIn.count
+            if start == 0 || !isLetter(chars[start - 1]) { return start }
+        }
+        return nil
     }
 
     /// Evaluates a plain-text expression like "4*4", "(2+3)^2", "sqrt(2)".
@@ -48,20 +113,24 @@ enum Evaluator {
         return parsed.value
     }
 
-    static func format(_ value: Double, maxFractionDigits: Int = 10) -> String {
+    static func format(_ value: Double, maxFractionDigits: Int = 10, minFractionDigits: Int = 0) -> String {
         let value = abs(value) < 1e-12 ? 0 : value  // hide floating-point noise like sin(pi) = 1.2e-16
-        if value == value.rounded(), abs(value) < 1e15 {
+        if value == value.rounded(), abs(value) < 1e15, minFractionDigits == 0, !options.groupThousands {
             return String(Int64(value))
         }
         let formatter = NumberFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.usesGroupingSeparator = false
-        if abs(value) >= 1e15 || abs(value) < 1e-6 {
+        formatter.usesGroupingSeparator = options.groupThousands
+        formatter.groupingSeparator = ","
+        formatter.groupingSize = 3
+        if abs(value) >= 1e15 || (abs(value) < 1e-6 && value != 0) {
             formatter.numberStyle = .scientific
             formatter.maximumFractionDigits = 6
         } else {
             formatter.numberStyle = .decimal
-            formatter.maximumFractionDigits = abs(value) < 0.01 ? 10 : maxFractionDigits
+            let maxDigits = min(options.decimals ?? maxFractionDigits, maxFractionDigits)
+            formatter.maximumFractionDigits = abs(value) < 0.01 && options.decimals == nil ? 10 : maxDigits
+            formatter.minimumFractionDigits = min(minFractionDigits, formatter.maximumFractionDigits)
         }
         return formatter.string(from: NSNumber(value: value)) ?? String(value)
     }
@@ -93,7 +162,7 @@ enum Evaluator {
 
     // MARK: Finding the expression
 
-    private static func isLetter(_ c: Character) -> Bool { c.isASCII && c.isLetter }
+    static func isLetter(_ c: Character) -> Bool { c.isASCII && c.isLetter }
     private static let symbols = Set("0123456789.,+-*/×÷^%()√π°! ")
     private static let validStart = Set("0123456789.(-√π")
 
@@ -111,6 +180,52 @@ enum Evaluator {
             if let parsed = parser.parse() { return (parsed, i) }
         }
         return nil
+    }
+
+    // MARK: Currency
+
+    /// Parses "<amount> <currency> in|to|as <currency>", also "$100 in eur" and "50€ to $".
+    private static func currencyConversion(_ chars: [Character]) -> (String, Int)? {
+        guard !Currency.rates.isEmpty else { return nil }
+        func name(endingAt end: Int) -> (String, Int)? {
+            var start = end
+            while start > 0, isLetter(chars[start - 1]) || Currency.symbols.contains(chars[start - 1]) { start -= 1 }
+            return start < end ? (String(chars[start..<end]), start) : nil
+        }
+        func skipSpaces(from end: Int) -> Int {
+            var i = end
+            while i > 0, chars[i - 1] == " " { i -= 1 }
+            return i
+        }
+
+        guard let (toName, toStart) = name(endingAt: chars.count), let to = Currency.code(for: toName) else { return nil }
+        var i = skipSpaces(from: toStart)
+        guard i < toStart, let (connector, connectorStart) = name(endingAt: i),
+              ["in", "to", "as"].contains(connector.lowercased()) else { return nil }
+        i = skipSpaces(from: connectorStart)
+
+        var from: String?
+        if let (fromName, fromStart) = name(endingAt: i), let code = Currency.code(for: fromName) {
+            from = code
+            i = skipSpaces(from: fromStart)
+        }
+        guard let (parsed, exprStart) = expressionSuffix(Array(chars[..<i])),
+              !parsed.usesX, let amount = parsed.value else { return nil }
+
+        var start = exprStart
+        if from == nil {  // "$100", "€ 50"
+            let j = skipSpaces(from: exprStart)
+            guard j > 0, Currency.symbols.contains(chars[j - 1]),
+                  let code = Currency.code(for: String(chars[j - 1])) else { return nil }
+            from = code
+            start = j - 1
+        }
+        guard let from, let result = Currency.convert(amount, from: from, to: to) else { return nil }
+
+        let number = format(result, maxFractionDigits: 2, minFractionDigits: 2)
+        if toName.count == 1 { return ("\(toName)\(number)", start) }       // "$54.12"
+        let label = toName.count == 3 && toName.lowercased() == to.lowercased() ? to : toName
+        return ("\(number) \(label)", start)                                // "54.12 EUR", "54.12 euros"
     }
 
     // MARK: Unit conversion
@@ -303,6 +418,7 @@ private struct Parsed {
     let function: (Double) -> Double
     let usesX: Bool
     let usesTrig: Bool
+    let usesAns: Bool
     let operations: Int
 
     /// The value of an expression without x, if it is a real number.
@@ -320,6 +436,7 @@ private struct Parser {
     private var operations = 0
     private var usesX = false
     private var usesTrig = false
+    private var usesAns = false
     /// Whether the last postfix parsed ended in "%", so "200 + 10%" can mean 200 + 10% of 200.
     private var lastWasPercent = false
 
@@ -329,7 +446,7 @@ private struct Parser {
         guard let f = expression() else { return nil }
         skipSpaces()
         guard pos == chars.count else { return nil }
-        return Parsed(function: f, usesX: usesX, usesTrig: usesTrig, operations: operations)
+        return Parsed(function: f, usesX: usesX, usesTrig: usesTrig, usesAns: usesAns, operations: operations)
     }
 
     private mutating func skipSpaces() {
@@ -486,6 +603,10 @@ private struct Parser {
             return { _ in 2 * .pi }
         case "e":
             return { _ in M_E }
+        case "ans":
+            guard let answer = Evaluator.lastAnswer else { return nil }
+            usesAns = true
+            return { _ in answer }
         case let name:
             guard let function = Parser.functions[name], let argument = postfix() else { return nil }
             if ["sin", "cos", "tan"].contains(name) { usesTrig = true }
